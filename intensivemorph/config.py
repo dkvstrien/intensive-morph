@@ -52,6 +52,11 @@ class IntensiveMorphConfig:
     # --- Corpus paths ---
     bundled_corpus_path: Optional[str] = None  # path to bundled corpus JSON
 
+    # --- Reader mode ---
+    mode: str = "review"  # "review" (scored by density) or "reader" (sequential by source)
+    reader_batch_size: int = 1  # sentences per batch in reader mode
+    reader_active_source: str = ""  # currently active source in reader mode
+
     # --- Anki deck settings ---
     deck_name: str = "IntensiveMorph"
     target_tag: str = "soak::target"

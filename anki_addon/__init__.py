@@ -32,9 +32,9 @@ from aqt.utils import show_info, show_warning
 # Soak core library
 import sys
 ADDON_DIR = Path(__file__).resolve().parent
-IM_LIB_DIR = ADDON_DIR.parent / "intensivemorph"
-if str(SOAK_LIB_DIR) not in sys.path:
-    sys.path.insert(0, str(SOAK_LIB_DIR))
+IM_LIB_DIR = str(ADDON_DIR.parent / "intensivemorph")
+if IM_LIB_DIR not in sys.path:
+    sys.path.insert(0, IM_LIB_DIR)
 
 from intensivemorph.config import IntensiveMorphConfig
 from intensivemorph.models import IntensiveMorphDB, Stage, LemmaState, SentenceRecord
@@ -44,6 +44,7 @@ from intensivemorph.scheduler import IntensiveMorphScheduler
 from intensivemorph.sentence_pool import SentencePool
 from intensivemorph.target_list import TargetList
 from intensivemorph.importer import TextImporter
+from intensivemorph.reader import ReaderSession
 
 # --- Globals ---
 _soak_config: Optional[IntensiveMorphConfig] = None
@@ -53,27 +54,30 @@ _soak_scheduler: Optional[IntensiveMorphScheduler] = None
 _soak_pool: Optional[SentencePool] = None
 _soak_targets: Optional[TargetList] = None
 _soak_morphemizer: Optional[Morphemizer] = None
+_soak_reader: Optional[ReaderSession] = None
 
 # How many ms ago to look in revlog for soak reviews
 REVLOG_LOOKBACK_HOURS = 48
 
 # Note type name we create for soak cards
-SOAK_NOTE_TYPE = "Soak Sentence"
-SOAK_DECK_NAME = "Soak"
-SOAK_ACTIVE_DECK = "Soak::Active"
-SOAK_DONE_DECK = "Soak::Done"
-SOAK_SRS_DECK = "Soak::SRS"
+SOAK_NOTE_TYPE = "IntensiveMorph Sentence"
+SOAK_DECK_NAME = "IntensiveMorph"
+SOAK_ACTIVE_DECK = "IntensiveMorph::Active"
+SOAK_DONE_DECK = "IntensiveMorph::Done"
+SOAK_SRS_DECK = "IntensiveMorph::SRS"
+SOAK_READER_DECK = "IntensiveMorph::Reader"
 
 # Fields on soak notes
 FIELD_SENTENCE = "Sentence"
 FIELD_TRANSLATION = "Translation"
-FIELD_LEMMAS = "Soak-Lemmas"  # JSON list of lemmas
-FIELD_SOURCE = "Soak-Source"
+FIELD_LEMMAS = "IntensiveMorph-Lemmas"  # JSON list of lemmas
+FIELD_SOURCE = "IntensiveMorph-Source"
 
 # Tags
-TAG_ACTIVE = "soak::active"
-TAG_SRS = "soak::srs"
-TAG_DONE = "soak::done"
+TAG_ACTIVE = "intensivemorph::active"
+TAG_SRS = "intensivemorph::srs"
+TAG_DONE = "intensivemorph::done"
+TAG_READER = "intensivemorph::reader"
 
 
 # ─── Initialization ──────────────────────────────────────────────────────────
@@ -85,13 +89,13 @@ def get_soak_db_path() -> Path:
 
 def get_soak_config_path() -> Path:
     assert mw is not None and mw.pm is not None
-    return Path(mw.pm.profileFolder()) / "soak_config.json"
+    return Path(mw.pm.profileFolder()) / "intensivemorph_config.json"
 
 
 def init_soak() -> None:
     """Initialize Soak on profile open."""
     global _soak_config, _soak_db, _soak_inference, _soak_scheduler
-    global _soak_pool, _soak_targets, _soak_morphemizer
+    global _soak_pool, _soak_targets, _soak_morphemizer, _soak_reader
 
     config_path = get_soak_config_path()
     if config_path.exists():
@@ -107,6 +111,7 @@ def init_soak() -> None:
     _soak_scheduler = IntensiveMorphScheduler(_soak_config, _soak_db)
     _soak_pool = SentencePool(_soak_config, _soak_db)
     _soak_targets = TargetList(_soak_config, _soak_db, _soak_morphemizer)
+    _soak_reader = ReaderSession(_soak_config, _soak_db)
 
     # Ensure the soak note type and decks exist
     _ensure_note_type()
@@ -148,7 +153,7 @@ def _ensure_decks() -> None:
     """Create the soak deck hierarchy."""
     assert mw is not None
     for deck_name in [SOAK_DECK_NAME, SOAK_ACTIVE_DECK,
-                       SOAK_DONE_DECK, SOAK_SRS_DECK]:
+                       SOAK_DONE_DECK, SOAK_SRS_DECK, SOAK_READER_DECK]:
         did = mw.col.decks.id(deck_name)
         mw.col.decks.name_if_exists(deck_name)  # ensure it's registered
 
@@ -171,7 +176,7 @@ def read_revlog() -> List[dict]:
 
     # Get all soak cards in our decks
     soak_deck_ids = []
-    for name in [SOAK_ACTIVE_DECK, SOAK_SRS_DECK]:
+    for name in [SOAK_ACTIVE_DECK, SOAK_SRS_DECK, SOAK_READER_DECK]:
         did = mw.col.decks.id_for_name(name)
         if did:
             soak_deck_ids.append(did)
@@ -399,6 +404,68 @@ def schedule_srs_cards(srs_items: List[Tuple[LemmaState, SentenceRecord]]) -> in
     return scheduled
 
 
+def sync_reader_cards() -> dict:
+    """
+    Sync reader-mode cards to the Reader deck.
+
+    In reader mode, cards are created in sequential order by source/position
+    rather than by score.
+    """
+    assert mw is not None
+    assert _soak_reader is not None
+    assert _soak_config is not None
+    assert _soak_db is not None
+
+    reader_did = mw.col.decks.id(SOAK_READER_DECK)
+    model = mw.col.models.by_name(SOAK_NOTE_TYPE)
+    if model is None:
+        return {"error": "No Soak note type"}
+
+    source = _soak_config.reader_active_source
+    if not source:
+        sources = _soak_reader.get_sources()
+        if sources:
+            source = sources[0]["source"]
+            _soak_config.reader_active_source = source
+        else:
+            return {"error": "No sources available"}
+
+    report = {"added": 0, "already_in_deck": 0}
+
+    # Get existing reader card texts to avoid duplicates
+    existing_texts = set()
+    existing_card_ids = mw.col.find_cards(f"deck:{SOAK_READER_DECK}")
+    for cid in existing_card_ids:
+        card = mw.col.get_card(cid)
+        note = mw.col.get_note(card.nid)
+        if FIELD_SENTENCE in note:
+            existing_texts.add(note[FIELD_SENTENCE])
+
+    # Get next batch of sentences from reader
+    batch = _soak_reader.next_batch()
+    for sentence in batch:
+        if sentence.text in existing_texts:
+            report["already_in_deck"] += 1
+            continue
+
+        note = mw.col.new_note(model)
+        note[FIELD_SENTENCE] = sentence.text
+        note[FIELD_TRANSLATION] = sentence.translation or ""
+        note[FIELD_LEMMAS] = json.dumps(sentence.lemmas, ensure_ascii=False)
+        note[FIELD_SOURCE] = sentence.source
+        note.add_tag(TAG_READER)
+
+        card = mw.col.new_card(note)
+        card.did = reader_did
+        card.queue = QUEUE_TYPE_NEW
+        # Use position within source as the Anki due order
+        card.due = sentence.position
+        mw.col.add_note(note, card.did)
+        report["added"] += 1
+
+    return report
+
+
 def _escape_quotes(s: str) -> str:
     """Escape quotes for Anki search."""
     return s.replace('"', '\\"').replace("'", "\\'")
@@ -474,7 +541,7 @@ def run_full_maintenance() -> dict:
 def _log(category: str, message: str) -> None:
     """Append to soak event log."""
     assert mw is not None
-    log_path = Path(mw.pm.profileFolder()) / "soak_events.log"
+    log_path = Path(mw.pm.profileFolder()) / "intensivemorph_events.log"
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] [{category}] {message}\n")
@@ -488,16 +555,21 @@ def on_profile_did_open() -> None:
     # Print today's session summary on open
     if _soak_scheduler:
         session = _soak_scheduler.build_daily_session()
-        soak = len(session.get("soak_cards", []))
-        srs = len(session.get("srs_cards", []))
-        print(f"[Soak] Today: {soak} soak cards, {srs} SRS cards due")
+        mode = _soak_config.mode if _soak_config else "review"
+        if mode == "reader":
+            reader_count = len(session.get("reader_sentences", []))
+            print(f"[IntensiveMorph] Reader mode: {reader_count} sentences ready")
+        else:
+            soak = len(session.get("soak_cards", []))
+            srs = len(session.get("srs_cards", []))
+            print(f"[IntensiveMorph] Today: {soak} soak cards, {srs} SRS cards due")
 
 
 def add_menu_items() -> None:
     """Add Soak menu items under Tools."""
     assert mw is not None
 
-    menu = QMenu("Soak", mw)
+    menu = QMenu("IntensiveMorph", mw)
     mw.form.menuTools.addMenu(menu)
 
     # Run full maintenance (the main action)
@@ -505,6 +577,18 @@ def add_menu_items() -> None:
     action_maintenance.setShortcut("Ctrl+Shift+S")
     action_maintenance.triggered.connect(on_run_maintenance)
     menu.addAction(action_maintenance)
+
+    menu.addSeparator()
+
+    # Mode toggle
+    action_toggle_mode = QAction("Toggle Mode: Review ⇄ Reader", mw)
+    action_toggle_mode.triggered.connect(on_toggle_mode)
+    menu.addAction(action_toggle_mode)
+
+    # Sync reader cards (only active in reader mode)
+    action_sync_reader = QAction("Sync Reader Cards to Anki", mw)
+    action_sync_reader.triggered.connect(on_sync_reader)
+    menu.addAction(action_sync_reader)
 
     menu.addSeparator()
 
@@ -526,7 +610,7 @@ def add_menu_items() -> None:
     menu.addAction(action_today)
 
     # Stats
-    action_stats = QAction("Soak Statistics", mw)
+    action_stats = QAction("IntensiveMorph Statistics", mw)
     action_stats.triggered.connect(on_show_stats)
     menu.addAction(action_stats)
 
@@ -540,10 +624,54 @@ def add_menu_items() -> None:
 
 # ─── Menu Actions ────────────────────────────────────────────────────────────
 
+def on_toggle_mode() -> None:
+    """Toggle between review and reader mode."""
+    global _soak_config
+    if not _soak_config:
+        show_warning("IntensiveMorph not initialized.")
+        return
+
+    current = _soak_config.mode
+    new_mode = "reader" if current == "review" else "review"
+    _soak_config.mode = new_mode
+
+    # Save config
+    config_path = get_soak_config_path()
+    with open(config_path, "w") as f:
+        json.dump(_soak_config.to_dict(), f, indent=2, ensure_ascii=False)
+
+    show_info(f"IntensiveMorph switched to {'Reader' if new_mode == 'reader' else 'Review'} mode.")
+    _log("mode", f"Switched to {new_mode} mode")
+
+
+def on_sync_reader() -> None:
+    """Sync reader cards to Anki."""
+    if not all([_soak_reader, _soak_config]):
+        show_warning("IntensiveMorph not initialized.")
+        return
+
+    if _soak_config.mode != "reader":
+        show_info("Reader cards only sync in reader mode. "
+                  "Switch modes first (IntensiveMorph → Toggle Mode).")
+        return
+
+    assert mw is not None
+    operation = QueryOp(
+        parent=mw,
+        op=lambda _: sync_reader_cards(),
+        success=lambda r: show_info(
+            f"Reader sync complete.\n\n"
+            f"Added: {r.get('added', 0)} new cards\n"
+            f"Already in deck: {r.get('already_in_deck', 0)}"
+        ),
+    )
+    operation.with_progress("Syncing reader cards...").run_in_background()
+
+
 def on_run_maintenance() -> None:
     """Run full maintenance in background thread."""
     if not _soak_scheduler:
-        show_warning("Soak not initialized.")
+        show_warning("IntensiveMorph not initialized.")
         return
 
     assert mw is not None
@@ -552,17 +680,17 @@ def on_run_maintenance() -> None:
         op=lambda _: run_full_maintenance(),
         success=_on_maintenance_done,
     )
-    operation.with_progress("Running Soak maintenance...").run_in_background()
+    operation.with_progress("Running IntensiveMorph maintenance...").run_in_background()
 
 
 def _on_maintenance_done(report: dict) -> None:
     """Show maintenance results."""
     if "error" in report:
-        show_warning(f"Soak error: {report['error']}")
+        show_warning(f"IntensiveMorph error: {report['error']}")
         return
 
     show_info(
-        "Soak Maintenance Complete\n\n"
+        "IntensiveMorph Maintenance Complete\n\n"
         f"Reviews processed: {report.get('reviews_processed', 0)}\n"
         f"Graduated to SRS: {report.get('graduates_to_srs', 0)}\n"
         f"Graduated to Mature: {report.get('graduates_to_mature', 0)}\n"
@@ -608,11 +736,11 @@ def on_manage_targets() -> None:
     from aqt.qt import QDialog, QVBoxLayout, QTextEdit, QPushButton
 
     if not all([_soak_targets, _soak_db]):
-        show_warning("Soak not initialized.")
+        show_warning("IntensiveMorph not initialized.")
         return
 
     dialog = QDialog(mw)
-    dialog.setWindowTitle("Soak Target Words")
+    dialog.setWindowTitle("IntensiveMorph Target Words")
     dialog.resize(500, 400)
     layout = QVBoxLayout()
 
@@ -639,22 +767,39 @@ def on_manage_targets() -> None:
 def on_show_session() -> None:
     """Show today's planned session."""
     if not _soak_scheduler:
-        show_warning("Soak not initialized.")
+        show_warning("IntensiveMorph not initialized.")
         return
 
     session = _soak_scheduler.build_daily_session()
-    show_info(
-        "Today's Session\n\n"
-        f"Soak-in cards: {len(session.get('soak_cards', []))}\n"
-        f"SRS reviews: {len(session.get('srs_cards', []))}\n"
-        f"1T confirmations: {len(session.get('confirmations', []))}"
-    )
+    mode = _soak_config.mode if _soak_config else "review"
+
+    if mode == "reader":
+        source = session.get("source", "none")
+        reader_sents = session.get("reader_sentences", [])
+        total = session.get("total_sentences", 0)
+        pos = session.get("current_position", 0)
+        pct = session.get("progress_pct", 0.0)
+        show_info(
+            "Reader Mode Session\n\n"
+            f"Source: {source}\n"
+            f"Position: {pos} / {total}\n"
+            f"Progress: {pct}%\n"
+            f"Batch ready: {len(reader_sents)} sentences\n\n"
+            "Sync Reader Cards to Anki, then study."
+        )
+    else:
+        show_info(
+            "Today's Session\n\n"
+            f"Soak-in cards: {len(session.get('soak_cards', []))}\n"
+            f"SRS reviews: {len(session.get('srs_cards', []))}\n"
+            f"1T confirmations: {len(session.get('confirmations', []))}"
+        )
 
 
 def on_show_stats() -> None:
     """Show overall statistics."""
     if not all([_soak_db, _soak_pool, _soak_targets]):
-        show_warning("Soak not initialized.")
+        show_warning("IntensiveMorph not initialized.")
         return
 
     all_lemmas = _soak_db.get_all_lemmas()
@@ -664,9 +809,11 @@ def on_show_stats() -> None:
 
     stats = _soak_pool.compute_density_stats()
     targets = _soak_targets.list_targets()
+    mode = _soak_config.mode if _soak_config else "review"
 
     show_info(
-        f"Soak Statistics\n\n"
+        f"IntensiveMorph Statistics\n\n"
+        f"Mode: {'Reader' if mode == 'reader' else 'Review'}\n\n"
         f"Total lemmas: {len(all_lemmas)}\n"
         f"  New: {by_stage.get('new', 0)}\n"
         f"  Burst: {by_stage.get('burst', 0)}\n"
@@ -681,9 +828,9 @@ def on_show_stats() -> None:
 
 
 def on_view_log() -> None:
-    """Show the Soak event log."""
+    """Show the event log."""
     assert mw is not None
-    log_path = Path(mw.pm.profileFolder()) / "soak_events.log"
+    log_path = Path(mw.pm.profileFolder()) / "intensivemorph_events.log"
     if not log_path.exists():
         show_info("No events logged yet.")
         return
@@ -693,7 +840,7 @@ def on_view_log() -> None:
 
     # Show last 50 lines
     last_lines = lines[-50:]
-    show_info("Soak Event Log (last 50)\n\n" + "".join(last_lines))
+    show_info("IntensiveMorph Event Log (last 50)\n\n" + "".join(last_lines))
 
 
 # ─── Register Hooks ─────────────────────────────────────────────────────────

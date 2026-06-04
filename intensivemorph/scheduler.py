@@ -7,6 +7,10 @@ Runs as a cron/anacron-like task:
   3. Generate 1T confirmation cards for graduating lemmas
   4. Reposition cards in Anki queue (Anki addon mode)
   5. Clean up stale data
+
+Supports two modes for build_daily_session:
+  - "review": score-based density selection (default)
+  - "reader": sequential delivery by source/position
 """
 
 from __future__ import annotations
@@ -128,8 +132,8 @@ class IntensiveMorphScheduler:
                     report["graduates_to_srs"] += 1
                 self.db.upsert_lemma(lemma)
 
-        # 3. Select sentences for soak session
-        selected = self.pool.select_sentences(self.config.daily_soak_quota)
+        # 3. Select sentences for soak session (always use review mode for nightly)
+        selected = self.pool.select_sentences(self.config.daily_soak_quota, mode="review")
         report["sentences_selected"] = len(selected)
 
         # 4. Generate 1T confirmations for lemmas near graduation
@@ -152,23 +156,36 @@ class IntensiveMorphScheduler:
 
         return report
 
-    def build_daily_session(self) -> dict:
+    def build_daily_session(self, mode: Optional[str] = None) -> dict:
         """
         Build today's study session plan.
 
-        Returns a dict with:
+        Args:
+            mode: "review" (score-based) or "reader" (sequential by source).
+                  Defaults to config.mode.
+
+        In review mode:
           - soak_cards: list of (SentenceRecord, score) for today
           - srs_cards: list of (LemmaState, SentenceRecord) for due SRS reviews
           - confirmations: list of LemmaState needing 1T tests
+
+        In reader mode:
+          - reader_sentences: list of (SentenceRecord, position) for today's reading
+          - source info
         """
-        result: dict = {
-            "soak_cards": [],
-            "srs_cards": [],
-            "confirmations": [],
-        }
+        mode = mode or self.config.mode
+        result: dict = {}
+
+        if mode == "reader":
+            return self._build_reader_session()
+
+        # Default: review mode
+        result["soak_cards"] = []
+        result["srs_cards"] = []
+        result["confirmations"] = []
 
         # --- Soak-in cards ---
-        selected = self.pool.select_sentences(self.config.daily_soak_quota)
+        selected = self.pool.select_sentences(self.config.daily_soak_quota, mode="review")
         result["soak_cards"] = selected
 
         # --- SRS cards due today ---
@@ -199,6 +216,40 @@ class IntensiveMorphScheduler:
                 result["confirmations"].append(lemma)
 
         return result
+
+    def _build_reader_session(self) -> dict:
+        """
+        Build a reader-mode session.
+
+        Returns sentences from the active source in position order.
+        """
+        from .reader import ReaderSession  # Lazy import to avoid circular deps
+
+        reader = ReaderSession(self.config, self.db)
+        source = self.config.reader_active_source
+
+        if not source:
+            sources = reader.get_sources()
+            if sources:
+                source = sources[0]["source"]
+                self.config.reader_active_source = source
+            else:
+                return {
+                    "reader_sentences": [],
+                    "source": "",
+                    "error": "No sources available. Import sentences first."
+                }
+
+        status = reader.start_source(source)
+        batch = reader.next_batch()
+
+        return {
+            "reader_sentences": [(s, float(s.position)) for s in batch],
+            "source": source,
+            "total_sentences": status.get("total", 0),
+            "current_position": status.get("current_position", 0),
+            "progress_pct": status.get("progress_pct", 0.0),
+        }
 
     def apply_srs_review(self, lemma: str, passed: bool) -> dict:
         """

@@ -149,6 +149,7 @@ class TextImporter:
                     translation=translations.get(sentence, ""),
                     lemmas=lemmas,
                     source=path.name,
+                    position=i,
                 )
                 if self.db.add_sentence(record):
                     count += 1
@@ -170,6 +171,7 @@ class TextImporter:
                 translation=translations.get(sentence, ""),
                 lemmas=lemmas,
                 source=source,
+                position=i,
             )
             if self.db.add_sentence(record):
                 count += 1
@@ -213,7 +215,7 @@ class TextImporter:
                 continue
             if len(s) < 3:  # Too short
                 continue
-            if len(s) > 500:  # Too long (not a real sentence)
+            if len(s) > 2000:  # Very long — skip (likely a formatting error)
                 continue
             if s[0].islower():  # Doesn't start with capital letter
                 continue
@@ -224,7 +226,7 @@ class TextImporter:
 
     def _import_sentences(self, raw_sentences: List[str],
                           source: str, max_sentences: int) -> int:
-        """Batch-import a list of sentence strings."""
+        """Batch-import a list of sentence strings with position tracking."""
         count = 0
         for i, sentence in enumerate(raw_sentences):
             if i >= max_sentences:
@@ -236,6 +238,7 @@ class TextImporter:
                 text=sentence,
                 lemmas=lemmas,
                 source=source,
+                position=i,
             )
             if self.db.add_sentence(record):
                 count += 1

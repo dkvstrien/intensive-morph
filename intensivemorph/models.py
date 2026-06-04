@@ -3,7 +3,7 @@ Soak data models — lemma states, sentence records, and DB schema.
 
 This module defines the core data structures that drive soak mode:
 - LemmaState: tracks a single word through soak-in → SRS → mature
-- SentenceRecord: a sentence with its lemma composition
+- SentenceRecord: a sentence with its lemma composition and position metadata
 - IntensiveMorphDB: SQLite database for persistence
 """
 
@@ -112,6 +112,7 @@ class SentenceRecord:
     lemmas: List[str] = field(default_factory=list)  # all lemmas in the sentence
     source: str = ""  # e.g., filename, corpus name
     is_user_sentence: bool = False  # user-injected via API
+    position: int = 0  # position within source (for reader mode ordering)
 
     def count_target_lemmas(self, target_set: Set[str]) -> int:
         """Count how many lemmas in this sentence are in the target set."""
@@ -133,6 +134,7 @@ class SentenceRecord:
             "lemmas": self.lemmas,
             "source": self.source,
             "is_user_sentence": self.is_user_sentence,
+            "position": self.position,
         }
 
 
@@ -147,6 +149,7 @@ class IntensiveMorphDB:
         self.con = sqlite3.connect(str(self.db_path))
         self.con.row_factory = sqlite3.Row
         self._create_tables()
+        self._migrate_tables()
 
     def _create_tables(self) -> None:
         with self.con:
@@ -174,6 +177,7 @@ class IntensiveMorphDB:
                     lemmas TEXT NOT NULL DEFAULT '[]',
                     source TEXT NOT NULL DEFAULT '',
                     is_user_sentence INTEGER NOT NULL DEFAULT 0,
+                    position INTEGER NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL DEFAULT (unixepoch())
                 );
 
@@ -197,11 +201,28 @@ class IntensiveMorphDB:
                     FOREIGN KEY (sentence_id) REFERENCES sentences(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS reader_progress (
+                    source TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL DEFAULT (unixepoch()),
+                    PRIMARY KEY (source)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_lemmas_stage ON lemmas(stage);
                 CREATE INDEX IF NOT EXISTS idx_lemmas_is_target ON lemmas(is_target);
                 CREATE INDEX IF NOT EXISTS idx_sentence_lemma ON sentence_lemma_map(lemma);
                 CREATE INDEX IF NOT EXISTS idx_review_log_lemma ON review_log(lemma);
+                CREATE INDEX IF NOT EXISTS idx_sentences_source ON sentences(source);
             """)
+
+    def _migrate_tables(self) -> None:
+        """Add columns that may not exist in older DBs."""
+        with self.con:
+            # Add position column if missing (pre-reader-mode DBs)
+            try:
+                self.con.execute("ALTER TABLE sentences ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
     # --- Lemma CRUD ---
 
@@ -287,13 +308,14 @@ class IntensiveMorphDB:
         with self.con:
             cursor = self.con.execute("""
                 INSERT OR IGNORE INTO sentences
-                    (text, translation, lemmas, source, is_user_sentence)
-                VALUES (?, ?, ?, ?, ?)
+                    (text, translation, lemmas, source, is_user_sentence, position)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 record.text, record.translation,
                 json.dumps(record.lemmas),
                 record.source,
                 1 if record.is_user_sentence else 0,
+                record.position,
             ))
             sentence_id = cursor.lastrowid
 
@@ -317,6 +339,7 @@ class IntensiveMorphDB:
             lemmas=json.loads(row["lemmas"]),
             source=row["source"],
             is_user_sentence=bool(row["is_user_sentence"]),
+            position=row["position"],
         )
 
     def get_all_sentences(self) -> List[SentenceRecord]:
@@ -330,6 +353,7 @@ class IntensiveMorphDB:
                 lemmas=json.loads(r["lemmas"]),
                 source=r["source"],
                 is_user_sentence=bool(r["is_user_sentence"]),
+                position=r["position"],
             )
             for r in rows
         ]
@@ -349,6 +373,7 @@ class IntensiveMorphDB:
                 lemmas=json.loads(r["lemmas"]),
                 source=r["source"],
                 is_user_sentence=bool(r["is_user_sentence"]),
+                position=r["position"],
             )
             for r in rows
         ]
@@ -358,6 +383,52 @@ class IntensiveMorphDB:
             SELECT COUNT(*) as cnt FROM sentence_lemma_map WHERE lemma = ?
         """, (lemma,)).fetchone()
         return row["cnt"] if row else 0
+
+    def get_sentences_by_source(self, source: str) -> List[SentenceRecord]:
+        """Get all sentences from a specific source, ordered by position."""
+        rows = self.con.execute("""
+            SELECT * FROM sentences
+            WHERE source = ?
+            ORDER BY position ASC, id ASC
+        """, (source,)).fetchall()
+        return [
+            SentenceRecord(
+                text=r["text"],
+                translation=r["translation"],
+                lemmas=json.loads(r["lemmas"]),
+                source=r["source"],
+                is_user_sentence=bool(r["is_user_sentence"]),
+                position=r["position"],
+            )
+            for r in rows
+        ]
+
+    def get_sources(self) -> List[str]:
+        """Get list of all unique sentence sources."""
+        rows = self.con.execute(
+            "SELECT DISTINCT source FROM sentences WHERE source != '' ORDER BY source"
+        ).fetchall()
+        return [r["source"] for r in rows]
+
+    # --- Reader progress ---
+
+    def get_reader_progress(self, source: str) -> int:
+        """Get the current reading position for a source."""
+        row = self.con.execute(
+            "SELECT position FROM reader_progress WHERE source = ?", (source,)
+        ).fetchone()
+        return row["position"] if row else 0
+
+    def set_reader_progress(self, source: str, position: int) -> None:
+        """Set the current reading position for a source."""
+        with self.con:
+            self.con.execute("""
+                INSERT INTO reader_progress (source, position, updated_at)
+                VALUES (?, ?, unixepoch())
+                ON CONFLICT(source) DO UPDATE SET
+                    position = excluded.position,
+                    updated_at = unixepoch()
+            """, (source, position))
 
     # --- Review log ---
 

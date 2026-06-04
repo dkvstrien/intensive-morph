@@ -42,6 +42,7 @@ from intensivemorph.scheduler import IntensiveMorphScheduler
 from intensivemorph.sentence_pool import SentencePool
 from intensivemorph.target_list import TargetList
 from intensivemorph.importer import TextImporter
+from intensivemorph.reader import ReaderSession
 
 
 def get_db_path() -> Path:
@@ -122,6 +123,88 @@ def main():
             print(f"Cleared {count} targets")
         else:
             print("Usage: soak targets <add|remove|list|load|save|clear> [...]")
+
+    # --- READER MODE ---
+    if command == "reader" and len(args) >= 2:
+        reader = ReaderSession(config, db)
+        sub = args[1]
+
+        if sub == "sources":
+            sources = reader.get_sources()
+            if not sources:
+                print("No sources available. Import sentences first.")
+            else:
+                print(f"Available sources ({len(sources)}):")
+                for s in sources:
+                    print(f"    {s['source']}")
+                    print(f"      {s['total_sentences']} sentences, "
+                          f"position {s['current_position']}, "
+                          f"{s['progress_pct']}% complete")
+
+        elif sub == "start" and len(args) >= 3:
+            source = args[2]
+            result = reader.start_source(source)
+            if "error" in result:
+                print(f"Error: {result['error']}")
+            else:
+                config.reader_active_source = source
+                save_config(config)
+                print(f"Started reading: {result['source']}")
+                print(f"  Total sentences: {result['total']}")
+                print(f"  Position: {result['current_position']}")
+                print(f"  Progress: {result['progress_pct']}%")
+                print(f"  Current: {result['current_sentence']}")
+
+        elif sub == "next":
+            batch = reader.next_batch()
+            if not batch:
+                print("No more sentences. You've finished this source!")
+            else:
+                for s in batch:
+                    print(f"[{s.position}] {s.text}")
+                if len(batch) == 1:
+                    reader.advance(1)
+                    print(f"→ Advanced to position {reader.status().get('current_position', 0)}")
+                else:
+                    reader.advance(len(batch))
+                    print(f"→ Advanced by {len(batch)} sentences")
+
+        elif sub == "prev":
+            batch = reader.prev_batch()
+            if not batch:
+                print("At the beginning of the source.")
+            else:
+                for s in batch:
+                    print(f"[{s.position}] {s.text}")
+                print(f"→ Went back to position {batch[0].position}")
+
+        elif sub == "jump" and len(args) >= 3:
+            try:
+                pos = int(args[2])
+            except ValueError:
+                print("Position must be a number")
+            else:
+                batch = reader.jump_to(pos)
+                if batch:
+                    for s in batch:
+                        print(f"[{s.position}] {s.text}")
+                else:
+                    print(f"No sentence at position {pos}")
+
+        elif sub == "status":
+            status = reader.status()
+            if "error" in status:
+                print(f"No active source. Use 'soak reader start <source>' first.")
+                print(f"Available sources: {[s['source'] for s in reader.get_sources()]}")
+            else:
+                print(f"Reading: {status['source']}")
+                print(f"  Position: {status['current_position']} / {status['total']}")
+                print(f"  Progress: {status['progress_pct']}%")
+                print(f"  Remaining: {status['remaining']} sentences")
+                print(f"  Current: {status['current_sentence']}")
+                print(f"  Lemmas in current: {status.get('lemmas_in_current', 0)}")
+        else:
+            print("Usage: soak reader <sources|start|next|prev|jump|status> [...]")
 
     # --- SENTENCES ---
     elif command == "sentences" and len(args) >= 2:
@@ -250,7 +333,7 @@ def main():
 
     else:
         print(f"Unknown command: {command}")
-        print("Use: soak targets|sentences|scheduler|review|confusion|in")
+        print("Use: soak targets|reader|sentences|scheduler|review|confusion|in")
 
     db.close()
 

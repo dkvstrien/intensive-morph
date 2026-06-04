@@ -6,6 +6,10 @@ Unlike AnkiMorphs' T+1 (exactly 1 unknown), Soak seeks high-density sentences:
   - Prioritizes words in burst phase
   - Penalizes sentences with mature words (waste of space)
   - Penalizes sentences with unknown non-target words (adds confusion)
+
+Supports two modes:
+  - "review" (default): score-based selection for high-density soak sessions
+  - "reader": sequential delivery by source/position for immersive reading
 """
 
 from __future__ import annotations
@@ -99,12 +103,33 @@ class SentencePool:
         self,
         count: int,
         exclude_sentence_ids: Optional[Set[int]] = None,
+        mode: Optional[str] = None,
     ) -> List[Tuple[SentenceRecord, float]]:
         """
-        Select the top-N sentences for today's soak session.
+        Select the top-N sentences for today's session.
 
-        Returns list of (SentenceRecord, score) sorted by score descending.
+        Args:
+            count: Maximum number of sentences to return.
+            exclude_sentence_ids: Optional set of sentence IDs to skip.
+            mode: "review" (scored by density, default) or "reader" (sequential by source).
+
+        Returns:
+            List of (SentenceRecord, score) sorted appropriately for the mode.
         """
+        mode = mode or self.config.mode
+
+        if mode == "reader":
+            return self._select_reader_sentences(count)
+
+        # Default: review mode — score-based selection
+        return self._select_review_sentences(count, exclude_sentence_ids)
+
+    def _select_review_sentences(
+        self,
+        count: int,
+        exclude_sentence_ids: Optional[Set[int]] = None,
+    ) -> List[Tuple[SentenceRecord, float]]:
+        """Score-based selection for review mode."""
         config = self.config
 
         # Gather all lemma states
@@ -128,11 +153,43 @@ class SentencePool:
             if score > 0:
                 scored.append((sentence, score))
 
-        # Also consider sentences not yet in DB? No — they need to be imported first.
-
         # Sort by score descending, take top N
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:count]
+
+    def _select_reader_sentences(
+        self,
+        count: int,
+    ) -> List[Tuple[SentenceRecord, float]]:
+        """
+        Sequential selection for reader mode.
+
+        Returns sentences from the active source in position order,
+        starting from the current reader progress position.
+
+        Each sentence gets a fake score = its position, so the
+        contract (SentenceRecord, float) is preserved.
+        """
+        source = self.config.reader_active_source
+        if not source:
+            return []
+
+        sentences = self.db.get_sentences_by_source(source)
+        if not sentences:
+            return []
+
+        start_pos = self.db.get_reader_progress(source)
+
+        # Find the sentence at or after the start position
+        start_idx = 0
+        for i, s in enumerate(sentences):
+            if s.position >= start_pos:
+                start_idx = i
+                break
+
+        # Take the next `count` sentences
+        batch = sentences[start_idx:start_idx + count]
+        return [(s, float(s.position)) for s in batch]
 
     def select_sentences_for_lemma(
         self, lemma: str, count: int = 5
