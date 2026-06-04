@@ -34,12 +34,6 @@ import sys
 ADDON_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = str(ADDON_DIR.parent)
 
-# Remove the addon directory from sys.path to avoid shadowing the
-# intensivemorph core library package (same name, different location).
-addon_dir = str(ADDON_DIR)
-while addon_dir in sys.path:
-    sys.path.remove(addon_dir)
-
 # Add project root so we can import from intensivemorph.*
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -853,6 +847,5 @@ def on_view_log() -> None:
 
 # ─── Register Hooks ─────────────────────────────────────────────────────────
 
-from anki.hooks import add_hook
-add_hook("profile_did_open", on_profile_did_open)
+gui_hooks.profile_did_open.append(on_profile_did_open)
 gui_hooks.main_window_did_init.append(add_menu_items)
