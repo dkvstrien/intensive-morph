@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "intensive-morph"
+version = "0.2.0"
+description = "High-density multi-target sentence immersion for Anki"
+readme = "README.md"
+license = {text = "AGPL-3.0-only"}
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+ru = ["pymorphy3>=2.0", "pymorphy3-dicts-ru"]
+de = ["spacy>=3.7", "de-core-news-sm"]
+fr = ["spacy>=3.7", "fr-core-news-sm"]
+es = ["spacy>=3.7", "es-core-news-sm"]
+all = ["pymorphy3>=2.0", "spacy>=3.7"]
+
+[tool.setuptools.packages.find]
+include = ["intensivemorph*"]
