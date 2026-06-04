@@ -156,8 +156,7 @@ def _ensure_decks() -> None:
     assert mw is not None
     for deck_name in [SOAK_DECK_NAME, SOAK_ACTIVE_DECK,
                        SOAK_DONE_DECK, SOAK_SRS_DECK, SOAK_READER_DECK]:
-        did = mw.col.decks.id(deck_name)
-        mw.col.decks.name_if_exists(deck_name)  # ensure it's registered
+        mw.col.decks.id(deck_name)  # creates deck if missing, returns ID
 
 
 # ─── Review Processing ───────────────────────────────────────────────────────
