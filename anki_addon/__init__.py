@@ -32,9 +32,9 @@ from aqt.utils import show_info, show_warning
 # Soak core library
 import sys
 ADDON_DIR = Path(__file__).resolve().parent
-IM_LIB_DIR = str(ADDON_DIR.parent / "intensivemorph")
-if IM_LIB_DIR not in sys.path:
-    sys.path.insert(0, IM_LIB_DIR)
+PROJECT_ROOT = str(ADDON_DIR.parent)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from intensivemorph.config import IntensiveMorphConfig
 from intensivemorph.models import IntensiveMorphDB, Stage, LemmaState, SentenceRecord
